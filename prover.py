@@ -98,11 +98,33 @@ class Prover:
         # - A_values: witness[program.wires()[i].L]
         # - B_values: witness[program.wires()[i].R]
         # - C_values: witness[program.wires()[i].O]
-
+        A_values = [0 for _ in range(group_order)]
+        B_values = [0 for _ in range(group_order)]
+        C_values = [0 for _ in range(group_order)]
+        for i, wire in enumerate(program.wires()):
+            A_values[i] = witness[wire.L]
+            B_values[i] = witness[wire.R]
+            C_values[i] = witness[wire.O]
+        
         # Construct A, B, C Lagrange interpolation polynomials for
         # A_values, B_values, C_values
+        A = Polynomial(
+            list(map(Scalar, A_values)), Basis.LAGRANGE
+        )
+        B = Polynomial(
+            list(map(Scalar, B_values)), Basis.LAGRANGE
+        )
+        C = Polynomial(
+            list(map(Scalar, C_values)), Basis.LAGRANGE
+        )
+        self.A = A
+        self.B = B
+        self.C = C
 
         # Compute a_1, b_1, c_1 commitments to A, B, C polynomials
+        a_1 = setup.commit(A)
+        b_1 = setup.commit(B)
+        c_1 = setup.commit(C)
 
         # Sanity check that witness fulfils gate constraints
         assert (
@@ -127,6 +149,18 @@ class Prover:
         #
         # Note the convenience function:
         #       self.rlc(val1, val2) = val_1 + self.beta * val_2 + gamma
+        roots_of_unity = Scalar.roots_of_unity(group_order)
+        Z_values = [Scalar(1)]
+        for i in range(group_order):
+            Z_values.append(
+                Z_values[-1] *
+                self.rlc(self.A.values[i], roots_of_unity[i]) *
+                self.rlc(self.B.values[i], 2 * roots_of_unity[i]) *
+                self.rlc(self.C.values[i], 3 * roots_of_unity[i]) /
+                self.rlc(self.A.values[i], self.pk.S1.values[i]) /
+                self.rlc(self.B.values[i], self.pk.S2.values[i]) /
+                self.rlc(self.C.values[i], self.pk.S3.values[i])
+            )
 
         # Check that the last term Z_n = 1
         assert Z_values.pop() == 1
@@ -147,6 +181,9 @@ class Prover:
 
         # Construct Z, Lagrange interpolation polynomial for Z_values
         # Cpmpute z_1 commitment to Z polynomial
+        Z = Polynomial(Z_values, Basis.LAGRANGE)
+        z_1 = setup.commit(Z)
+        self.Z = Z
 
         # Return z_1
         return Message2(z_1)
@@ -155,27 +192,47 @@ class Prover:
         group_order = self.group_order
         setup = self.setup
 
+        fft_cofactor = self.fft_cofactor
+        alpha = self.alpha
+
         # Compute the quotient polynomial
 
         # List of roots of unity at 4x fineness, i.e. the powers of µ
         # where µ^(4n) = 1
+        quarter_roots = Scalar.roots_of_unity(group_order * 4)
 
         # Using self.fft_expand, move A, B, C into coset extended Lagrange basis
+        A_big = self.fft_expand(self.A)
+        B_big = self.fft_expand(self.B)
+        C_big = self.fft_expand(self.C)
 
         # Expand public inputs polynomial PI into coset extended Lagrange
+        PI_big = self.fft_expand(self.PI)
 
         # Expand selector polynomials pk.QL, pk.QR, pk.QM, pk.QO, pk.QC
         # into the coset extended Lagrange basis
+        QL_big, QR_big, QM_big, QO_big, QC_big = \
+            (self.fft_expand(x) for x in (self.pk.QL, self.pk.QR, self.pk.QM, self.pk.QO, self.pk.QC))
 
         # Expand permutation grand product polynomial Z into coset extended
         # Lagrange basis
+        Z_big = self.fft_expand(self.Z)
 
         # Expand shifted Z(ω) into coset extended Lagrange basis
+        Z_shifted_big = Z_big.shift(4)
 
         # Expand permutation polynomials pk.S1, pk.S2, pk.S3 into coset
         # extended Lagrange basis
+        S1_big = self.fft_expand(self.pk.S1)
+        S2_big = self.fft_expand(self.pk.S2)
+        S3_big = self.fft_expand(self.pk.S3)
 
         # Compute Z_H = X^N - 1, also in evaluation form in the coset
+        ZH_values = [
+            ((Scalar(w) * fft_cofactor) ** group_order - 1)
+            for w in quarter_roots
+        ]
+        ZH_big = Polynomial(ZH_values, Basis.LAGRANGE)
 
         # Compute L0, the Lagrange basis polynomial that evaluates to 1 at x = 1 = ω^0
         # and 0 at other roots of unity
@@ -200,6 +257,27 @@ class Prover:
         # 3. The permutation accumulator equals 1 at the start point
         #    (Z - 1) * L0 = 0
         #    L0 = Lagrange polynomial, equal at all roots of unity except 1
+        QUOT_values = [((
+            A_big.values[i] * QL_big.values[i] +
+            B_big.values[i] * QR_big.values[i] +
+            A_big.values[i] * B_big.values[i] * QM_big.values[i] +
+            C_big.values[i] * QO_big.values[i] +
+            PI_big.values[i] +
+            QC_big.values[i]
+        ) + (
+            self.rlc(A_big.values[i], fft_cofactor * quarter_roots[i]) *
+            self.rlc(B_big.values[i], 2 * fft_cofactor * quarter_roots[i]) *
+            self.rlc(C_big.values[i], 3 * fft_cofactor * quarter_roots[i])
+        ) * alpha * Z_big.values[i] - (
+            self.rlc(A_big.values[i], S1_big.values[i]) *
+            self.rlc(B_big.values[i], S2_big.values[i]) *
+            self.rlc(C_big.values[i], S3_big.values[i])
+        ) * alpha * Z_shifted_big.values[i] + (
+            (Z_big.values[i] - 1) * L0_big.values[i] * self.alpha ** 2
+        )) / ZH_big.values[i]
+        for i in range(group_order * 4)
+        ]
+        QUOT_big = Polynomial(QUOT_values, Basis.LAGRANGE)
 
         # Sanity check: QUOT has degree < 3n
         assert (
@@ -210,17 +288,24 @@ class Prover:
 
         # Split up T into T1, T2 and T3 (needed because T has degree 3n - 4, so is
         # too big for the trusted setup)
+        QUOT_coeffs = QUOT_big.coset_extended_lagrange_to_coeffs(fft_cofactor)
+        T1 = Polynomial(QUOT_coeffs.values[:group_order], Basis.MONOMIAL).fft()
+        T2 = Polynomial(QUOT_coeffs.values[group_order: group_order * 2], Basis.MONOMIAL).fft()
+        T3 = Polynomial(QUOT_coeffs.values[group_order * 2: group_order * 3], Basis.MONOMIAL).fft()
 
         # Sanity check that we've computed T1, T2, T3 correctly
         assert (
             T1.barycentric_eval(fft_cofactor)
-            + T2.barycentric_eval(fft_cofactor) * fft_cofactor**group_order
+            + T2.barycentric_eval(fft_cofactor) * fft_cofactor ** group_order
             + T3.barycentric_eval(fft_cofactor) * fft_cofactor ** (group_order * 2)
         ) == QUOT_big.values[0]
 
         print("Generated T1, T2, T3 polynomials")
 
         # Compute commitments t_lo_1, t_mid_1, t_hi_1 to T1, T2, T3 polynomials
+        t_lo_1 = setup.commit(T1)
+        t_mid_1 = setup.commit(T2)
+        t_hi_1 = setup.commit(T3)
 
         # Return t_lo_1, t_mid_1, t_hi_1
         return Message3(t_lo_1, t_mid_1, t_hi_1)
